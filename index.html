@@ -1,0 +1,151 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>RSF probe</title></head>
+<body style="background:#111;color:#0f0;font:12px monospace;white-space:pre-wrap;padding:16px;max-width:1200px">
+<h2 style="color:#fff">RSF API probe</h2>
+<pre id="out">starting...</pre>
+<script>
+const out = document.getElementById("out");
+let log = "";
+function L(s){ log += s + "\n"; out.textContent = log; }
+const t0 = Date.now();
+const elapsed = () => Math.round((Date.now() - t0)/1000) + "s";
+
+const PLACE = 2630924671;
+
+(async () => {
+  // 0. am I logged in? who am I?
+  try {
+    const me = await (await fetch("https://apis.roblox.com/v1/users", {credentials:"include"})).json();
+    L("ME: " + JSON.stringify(me));
+    window.__me = me;
+  } catch(e) { L("ME: ERR " + e.message); }
+  if (!window.__me) { L("NOT LOGGED IN"); return; }
+
+  // 1. presence API on self
+  try {
+    const t = performance.now();
+    const r = await fetch("https://apis.roblox.com/v1/presence/users", {
+      method: "POST", credentials: "include",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ userIds: [me.id] })
+    });
+    const dt = Math.round(performance.now() - t);
+    const d = await r.text();
+    L("PRESENCE self: http=" + r.status + " " + dt + "ms -> " + d.slice(0, 500));
+  } catch(e) { L("PRESENCE self: ERR " + e.message); }
+
+  // 2. server list v1 timing + shape
+  try {
+    const t = performance.now();
+    const r = await fetch("https://games.roblox.com/v1/games/" + PLACE + "/servers/Public?limit=100", {credentials:"include"});
+    const dt = Math.round(performance.now() - t);
+    const d = await r.json();
+    L("SERVERS v1: http=" + r.status + " " + dt + "ms servers=" + (d.data||[]).length + " hasNext=" + !!d.nextPageCursor);
+    if ((d.data||[]).length) {
+      L("SERVER sample: " + JSON.stringify(d.data[0]).slice(0, 600));
+      window.__sample = d.data;
+    }
+  } catch(e) { L("SERVERS v1: ERR " + e.message); }
+
+  // 2b. v2 shape
+  try {
+    const r = await fetch("https://games.roblox.com/v2/games/" + PLACE + "/servers/Public?limit=100", {credentials:"include"});
+    const d = await r.json();
+    L("SERVERS v2: http=" + r.status + " servers=" + (d.data||[]).length);
+    if ((d.data||[]).length) L("V2 sample: " + JSON.stringify(d.data[0]).slice(0, 400));
+  } catch(e) { L("SERVERS v2: ERR " + e.message); }
+
+  // 3. friend servers shape
+  try {
+    const r = await fetch("https://games.roblox.com/v1/games/" + PLACE + "/servers/Friend?limit=100", {credentials:"include"});
+    const d = await r.json();
+    L("SERVERS Friend: http=" + r.status + " servers=" + (d.data||[]).length);
+  } catch(e) { L("SERVERS Friend: ERR " + e.message); }
+
+  // 4. collect tokens from a few pages
+  const tokens = [];
+  const tokMap = new Map();
+  let cursor = null, pages = 0;
+  while (pages < 6) {
+    const r = await fetch("https://games.roblox.com/v1/games/" + PLACE + "/servers/Public?limit=100" + (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""), {credentials:"include"});
+    const d = await r.json();
+    for (const s of (d.data||[])) for (const t of (s.playerTokens||[])) { tokens.push(t); tokMap.set(t, s.id); }
+    if (!d.nextPageCursor) break;
+    cursor = d.nextPageCursor; pages++;
+  }
+  L("TOKENS collected: " + tokens.length + " (pages=" + (pages+1) + ")");
+
+  // 5. batch limits: 100 / 200 / 300 items
+  for (const N of [100, 200, 300]) {
+    const items = tokens.slice(0, N).map(t => ({ requestId: t, token: t, type: "AvatarHeadShot", size: "150x150", format: "png", isCircular: false }));
+    try {
+      const t = performance.now();
+      const r = await fetch("https://thumbnails.roblox.com/v1/batch", {
+        method: "POST", credentials: "include",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify(items)
+      });
+      const dt = Math.round(performance.now() - t);
+      const d = await r.json();
+      const states = {};
+      for (const it of (d.data||[])) states[it.state || ("code" + it.errorCode)] = (states[it.state || ("code" + it.errorCode)] || 0) + 1;
+      L("BATCH " + N + ": http=" + r.status + " " + dt + "ms returned=" + (d.data||[]).length + " states=" + JSON.stringify(states));
+      if (N === 100 && (d.data||[]).length) window.__batchSample = d.data.slice(0, 2);
+    } catch(e) { L("BATCH " + N + ": ERR " + e.message); }
+  }
+
+  // 6. batch with full-body (Avatar 420x420) for 50 items
+  try {
+    const items = tokens.slice(0, 50).map(t => ({ requestId: t, token: t, type: "Avatar", size: "420x420", format: "png", isCircular: false }));
+    const t = performance.now();
+    const r = await fetch("https://thumbnails.roblox.com/v1/batch", {
+      method: "POST", credentials: "include",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(items)
+    });
+    const dt = Math.round(performance.now() - t);
+    const d = await r.json();
+    const states = {};
+    for (const it of (d.data||[])) states[it.state || ("code" + it.errorCode)] = (states[it.state || ("code" + it.errorCode)] || 0) + 1;
+    L("BATCH-full 50: http=" + r.status + " " + dt + "ms states=" + JSON.stringify(states));
+  } catch(e) { L("BATCH-full 50: ERR " + e.message); }
+
+  // 7. target avatar headshot + full (self)
+  for (const [kind, ep, size] of [["head","avatar-headshot","150x150"],["full","avatar-full-body","420x420"]]) {
+    try {
+      const t = performance.now();
+      const r = await fetch("https://thumbnails.roblox.com/v1/users/" + ep + "?userIds=" + me.id + "&size=" + size + "&format=Png&isCircular=false", {credentials:"include"});
+      const dt = Math.round(performance.now() - t);
+      L("AVATAR " + kind + ": http=" + r.status + " " + dt + "ms -> " + (await r.text()).slice(0, 300));
+    } catch(e) { L("AVATAR " + kind + ": ERR " + e.message); }
+  }
+
+  // 8. concurrent server-page fetch timing (prefetch feasibility)
+  try {
+    const t = performance.now();
+    const res = await Promise.all([
+      fetch("https://games.roblox.com/v1/games/" + PLACE + "/servers/Public?limit=100"),
+      fetch("https://games.roblox.com/v1/games/" + PLACE + "/servers/Public?limit=100"),
+      fetch("https://games.roblox.com/v1/games/" + PLACE + "/servers/Public?limit=100")
+    ]);
+    L("CONCURRENT pages: " + Math.round(performance.now() - t) + "ms for 3 pages");
+  } catch(e) { L("CONCURRENT: ERR " + e.message); }
+
+  // 9. presence for a big batch of userIds (limit test)
+  try {
+    const ids = Array.from({length: 50}, (_, i) => me.id + i);
+    const t = performance.now();
+    const r = await fetch("https://apis.roblox.com/v1/presence/users", {
+      method: "POST", credentials: "include",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ userIds: ids })
+    });
+    const dt = Math.round(performance.now() - t);
+    const d = await r.text();
+    L("PRESENCE x50: http=" + r.status + " " + dt + "ms len=" + d.length + " -> " + d.slice(0, 300));
+  } catch(e) { L("PRESENCE x50: ERR " + e.message); }
+
+  L("DONE " + elapsed());
+})().catch(e => L("FATAL: " + e.stack || e.message || e));
+</script>
+</body></html>
